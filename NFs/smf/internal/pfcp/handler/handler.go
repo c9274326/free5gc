@@ -191,7 +191,12 @@ func HandlePfcpSessionReportRequest(msg *pfcpUdp.Message) {
 		}
 	}
 
+	// Debug: 記錄 PFCP Session Report Request 的類型
+	logger.PfcpLog.Debugf("[FastCleanup] PFCP Session Report Request received: SEID=%d, Usar=%v, Dldr=%v, UsageReport=%v",
+		SEID, req.ReportType.Usar, req.ReportType.Dldr, req.UsageReport != nil)
+
 	if req.ReportType.Usar && req.UsageReport != nil {
+		logger.PfcpLog.Debugf("[FastCleanup] Processing Usage Report with %d entries", len(req.UsageReport))
 		smContext.HandleReports(req.UsageReport, nil, nil, upfNodeID, "")
 		// After receiving the Usage Report, it should send charging request to the CHF
 		// and update the URR with the quota or other charging information according to

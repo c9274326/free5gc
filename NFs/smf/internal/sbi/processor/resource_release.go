@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/free5gc/nas/nasMessage"
+	"github.com/free5gc/openapi/models"
 	smf_context "github.com/free5gc/smf/internal/context"
 	"github.com/free5gc/smf/internal/logger"
 	"github.com/free5gc/smf/pkg/factory"
@@ -32,6 +33,11 @@ func (p *Processor) InitFastCleanup(config *factory.FastCleanup) {
 	// 設定釋放回調 - 使用網路發起的釋放
 	cleaner.SetReleaseCallback(func(smContext *smf_context.SMContext) error {
 		return p.NetworkInitiatedReleaseSession(smContext, nasMessage.Cause5GSMInsufficientResourcesForSpecificSliceAndDNN)
+	})
+
+	// 設定流量查詢回調 - 在清理前主動查詢 URR 流量
+	cleaner.SetQueryTrafficCallback(func(smContext *smf_context.SMContext) (uint64, uint64, error) {
+		return p.QuerySessionTraffic(smContext)
 	})
 
 	// 啟動清理器
@@ -73,6 +79,67 @@ func (p *Processor) NetworkInitiatedReleaseSession(smContext *smf_context.SMCont
 	}
 
 	return nil
+}
+
+// QuerySessionTraffic 查詢 PDU Session 的累計流量
+// 透過 PFCP Session Modification Request 主動查詢 URR
+// 返回: (totalVolume, totalPktNum, error)
+func (p *Processor) QuerySessionTraffic(smContext *smf_context.SMContext) (uint64, uint64, error) {
+	// 收集所有 URR
+	var urrList []*smf_context.URR
+	var targetUpf *smf_context.UPF
+
+	for _, dataPath := range smContext.Tunnel.DataPathPool {
+		if !dataPath.Activated {
+			continue
+		}
+		for node := dataPath.FirstDPNode; node != nil; node = node.Next() {
+			if node.UpLinkTunnel != nil && node.UpLinkTunnel.PDR != nil {
+				if node.UpLinkTunnel.PDR.URR != nil {
+					urrList = append(urrList, node.UpLinkTunnel.PDR.URR...)
+					if targetUpf == nil {
+						targetUpf = node.UPF
+					}
+				}
+			}
+			if node.DownLinkTunnel != nil && node.DownLinkTunnel.PDR != nil {
+				if node.DownLinkTunnel.PDR.URR != nil {
+					urrList = append(urrList, node.DownLinkTunnel.PDR.URR...)
+					if targetUpf == nil {
+						targetUpf = node.UPF
+					}
+				}
+			}
+		}
+	}
+
+	// 如果沒有 URR，無法查詢流量，使用 UrrReports 中的累計流量
+	if len(urrList) == 0 || targetUpf == nil {
+		// 從已收到的 UrrReports 中計算累計流量
+		var totalVolume, totalPktNum uint64
+		for _, report := range smContext.UrrReports {
+			totalVolume += report.TotalVolume
+			totalPktNum += report.TotalPktNum
+		}
+		logger.PduSessLog.Debugf("[FastCleanup] No URR found for UE[%s] PDUSessionID[%d], using cached reports: volume=%d, pktNum=%d",
+			smContext.Supi, smContext.PDUSessionID, totalVolume, totalPktNum)
+		return totalVolume, totalPktNum, nil
+	}
+
+	// 透過 QueryReport 查詢 URR（這會發送 PFCP Session Modification Request）
+	QueryReport(smContext, targetUpf, urrList, models.ChfConvergedChargingTriggerType_FORCED_REAUTHORISATION)
+
+	// 計算累計流量
+	var totalVolume, totalPktNum uint64
+	for _, report := range smContext.UrrReports {
+		totalVolume += report.TotalVolume
+		totalPktNum += report.TotalPktNum
+	}
+
+	logger.PduSessLog.Debugf("[FastCleanup] Queried traffic for UE[%s] PDUSessionID[%d]: volume=%d, pktNum=%d",
+		smContext.Supi, smContext.PDUSessionID, totalVolume, totalPktNum)
+
+	return totalVolume, totalPktNum, nil
 }
 
 // ForceCleanupIdleSessions 強制清理閒置的 Session（用於測試/手動觸發）

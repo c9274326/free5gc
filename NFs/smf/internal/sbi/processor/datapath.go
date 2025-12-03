@@ -190,6 +190,8 @@ func modifyExistingPfcpSession(
 			RcvMsg: rcvMsg,
 		}
 		if rsp.UsageReport != nil {
+			logger.PduSessLog.Infof("[FastCleanup] PFCP Session Modification Response contains UsageReport with %d entries",
+				len(rsp.UsageReport))
 			SEID := rcvMsg.PfcpMessage.Header.SEID
 			upfNodeID := smContext.GetNodeIDByLocalSEID(SEID)
 			smContext.HandleReports(nil, rsp.UsageReport, nil, upfNodeID, reportResaon)

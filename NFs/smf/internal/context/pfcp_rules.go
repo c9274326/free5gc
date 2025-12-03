@@ -70,15 +70,22 @@ func NewMeasurementPeriod(time time.Duration) UrrOpt {
 
 func NewVolumeThreshold(threshold uint64) UrrOpt {
 	return func(urr *URR) {
-		urr.ReportingTrigger.Volth = true
-		urr.VolumeThreshold = threshold
+		// Only set VOLTH trigger when threshold > 0
+		// Otherwise gtp5g will only update vol_th counter instead of period counter
+		if threshold > 0 {
+			urr.ReportingTrigger.Volth = true
+			urr.VolumeThreshold = threshold
+		}
 	}
 }
 
 func NewVolumeQuota(quota uint64) UrrOpt {
 	return func(urr *URR) {
-		urr.ReportingTrigger.Volqu = true
-		urr.VolumeQuota = quota
+		// Only set VOLQU trigger when quota > 0
+		if quota > 0 {
+			urr.ReportingTrigger.Volqu = true
+			urr.VolumeQuota = quota
+		}
 	}
 }
 

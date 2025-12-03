@@ -924,3 +924,328 @@ free5gc/NFs/smf/
     └── factory/
         └── config.go              # 配置結構（修改）
 ```
+
+---
+
+## Fix LastActiveTime
+
+本章節說明如何修復 `LastActiveTime` 無法正確更新的問題。當 UE 有實際流量時，`hasActualTraffic()` 仍然返回 `false`，導致 PDU Session 在連線後的固定時間被清理，而不是在沒有流量後的固定時間被清理。
+
+### 問題現象
+
+1. UE 透過 ping 測試確認有流量通過
+2. SMF 日誌顯示 `hasActualTraffic=false`
+3. Usage Report 中的 `TotalVolume=0`, `TotalPktNum=0`
+4. PDU Session 在 `IdleTimeout` 後被清理，即使 UE 一直有流量
+
+### 問題根因分析
+
+經過深入調查，發現問題涉及多個層面：
+
+#### 1. gtp5g 內核模組的計數器邏輯問題
+
+在 `gtp5g/src/gtpu/encap.c` 中，`update_urr_counter_and_send_report()` 函式的邏輯如下：
+
+```c
+// Calculate Volume measurement for each trigger
+if (urr->trigger & URR_RPT_TRIGGER_VOLTH) {
+    update_counter(&urr->vol_th, volume, uplink, mnop);
+    if (check_counter(&urr->vol_th, &urr->volumethreshold)) {
+        triggers[report_num] = USAR_TRIGGER_VOLTH;
+        urrs[report_num++] = urr;
+    }
+} else {
+    if (urr->period == 0) {
+        continue;
+    }
+    update_period_vol_counter(urr, volume, uplink, mnop);
+}
+```
+
+**關鍵問題**：當 `VOLTH`（Volume Threshold）觸發器被設置時，gtp5g **只會**更新 `vol_th` 計數器，而**不會**更新 period volume counter（vol1/vol2）。
+
+這意味著：
+- 當同時設置 `PERIO` 和 `VOLTH` 時，封包經過時只更新 `vol_th`
+- UPF 的 periodic timer 查詢的是 period volume counter
+- 因此 PERIO report 的 volume 總是 0
+
+#### 2. SMF 的 `NewVolumeThreshold()` 無條件設置 VOLTH
+
+在 `internal/context/pfcp_rules.go` 中，原始程式碼：
+
+```go
+func NewVolumeThreshold(threshold uint64) UrrOpt {
+    return func(urr *URR) {
+        urr.ReportingTrigger.Volth = true  // 無條件設置！
+        urr.VolumeThreshold = threshold
+    }
+}
+```
+
+即使 `threshold = 0`（配置中未設置 urrThreshold），`Volth` 仍會被設為 `true`。
+
+#### 3. UPF 的 MeasurementPeriod 單位轉換問題
+
+在 `NFs/upf/internal/forwarder/gtp5g.go` 中，原始程式碼有一個 TODO 註解：
+
+```go
+case ie.MeasurementPeriod:
+    measurePeriod, err = i.MeasurementPeriod()
+    // ...
+    // TODO: convert time.Duration -> ?
+    attrs = append(attrs, nl.Attr{
+        Type:  gtp5gnl.URR_MEASUREMENT_PERIOD,
+        Value: nl.AttrU32(measurePeriod),  // 直接傳入 time.Duration（納秒）
+    })
+```
+
+`time.Duration` 以納秒為單位，30 秒 = 30,000,000,000 納秒，超過 `uint32` 最大值（4,294,967,295），導致溢出。
+
+---
+
+### 修復方案
+
+#### 修復 1：SMF - `NewVolumeThreshold()` 條件檢查
+
+**檔案**：`NFs/smf/internal/context/pfcp_rules.go`
+
+```go
+func NewVolumeThreshold(threshold uint64) UrrOpt {
+    return func(urr *URR) {
+        // Only set VOLTH trigger when threshold > 0
+        // Otherwise gtp5g will only update vol_th counter instead of period counter
+        if threshold > 0 {
+            urr.ReportingTrigger.Volth = true
+            urr.VolumeThreshold = threshold
+        }
+    }
+}
+
+func NewVolumeQuota(quota uint64) UrrOpt {
+    return func(urr *URR) {
+        // Only set VOLQU trigger when quota > 0
+        if quota > 0 {
+            urr.ReportingTrigger.Volqu = true
+            urr.VolumeQuota = quota
+        }
+    }
+}
+```
+
+#### 修復 2：UPF - MeasurementPeriod 單位轉換
+
+**檔案**：`NFs/upf/internal/forwarder/gtp5g.go`
+
+**CreateURR 函式**：
+
+```go
+case ie.MeasurementPeriod:
+    measurePeriod, err = i.MeasurementPeriod()
+    if err != nil {
+        return err
+    }
+    if measurePeriod <= 0 {
+        return errors.New("invalid measurement period")
+    }
+    // Convert time.Duration (nanoseconds) to seconds for gtp5g kernel module
+    measurePeriodSec := uint32(measurePeriod / time.Second)
+    attrs = append(attrs, nl.Attr{
+        Type:  gtp5gnl.URR_MEASUREMENT_PERIOD,
+        Value: nl.AttrU32(measurePeriodSec),
+    })
+```
+
+**UpdateURR 函式**（同樣修改）：
+
+```go
+case ie.MeasurementPeriod:
+    v, err1 := i.MeasurementPeriod()
+    if err1 != nil {
+        return nil, err1
+    }
+    // Convert time.Duration (nanoseconds) to seconds for gtp5g kernel module
+    measurePeriodSec := uint32(v / time.Second)
+    attrs = append(attrs, nl.Attr{
+        Type:  gtp5gnl.URR_MEASUREMENT_PERIOD,
+        Value: nl.AttrU32(measurePeriodSec),
+    })
+```
+
+---
+
+### 配置注意事項
+
+為了讓 Fast Cleanup 正確運作，`smfcfg.yaml` 中的配置應該：
+
+```yaml
+urrPeriod: 30 # default usage report period in seconds
+# urrThreshold: 500000 # 註解掉或不設置，避免 VOLTH 觸發器被設置
+```
+
+**重要**：如果同時設置 `urrPeriod` 和 `urrThreshold`，由於 gtp5g 的限制，period counter 不會被正確更新。建議只使用 `urrPeriod` 來進行流量監測。
+
+---
+
+### 修改的檔案總覽（Fix LastActiveTime）
+
+| 檔案路徑 | 修改類型 | 說明 |
+|---------|---------|------|
+| `NFs/smf/internal/context/pfcp_rules.go` | 修改 | 條件檢查 threshold > 0 才設置 VOLTH |
+| `NFs/upf/internal/forwarder/gtp5g.go` | 修改 | MeasurementPeriod 單位轉換（納秒→秒） |
+| `config/smfcfg.yaml` | 修改 | 註解掉 urrThreshold |
+
+---
+
+### 問題流程圖
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        問題發生流程                              │
+└─────────────────────────────────────────────────────────────────┘
+
+SMF 配置
+┌─────────────────┐
+│ urrPeriod: 30   │
+│ urrThreshold: X │ ─────┐
+└─────────────────┘      │
+                         ▼
+                ┌────────────────────┐
+                │ NewVolumeThreshold │
+                │ Volth = true       │ ◄─── 即使 threshold=0 也設置！
+                └────────┬───────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │  URR 同時設置        │
+              │  PERIO + VOLTH       │
+              └──────────┬───────────┘
+                         │
+                         ▼
+                ┌────────────────────────────────────┐
+                │         gtp5g 內核模組              │
+                │                                    │
+                │  if (VOLTH) {                      │
+                │      update vol_th counter ✓       │
+                │  } else {                          │
+                │      update period counter ✗       │ ◄─── 不會執行！
+                │  }                                 │
+                └────────────────┬───────────────────┘
+                                 │
+                                 ▼
+                      ┌────────────────────┐
+                      │ PERIO Report       │
+                      │ TotalVolume = 0    │
+                      │ TotalPktNum = 0    │
+                      └────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │ hasActualTraffic()   │
+                    │ returns false        │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │ LastActiveTime       │
+                    │ 不更新！             │
+                    └──────────────────────┘
+```
+
+---
+
+### 修復後流程圖
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        修復後流程                                │
+└─────────────────────────────────────────────────────────────────┘
+
+SMF 配置
+┌─────────────────┐
+│ urrPeriod: 30   │
+│ # urrThreshold  │ ─────┐  （已註解）
+└─────────────────┘      │
+                         ▼
+                ┌────────────────────┐
+                │ NewVolumeThreshold │
+                │ threshold=0        │
+                │ → 不設置 Volth     │ ◄─── 修復點 1
+                └────────┬───────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │  URR 只設置          │
+              │  PERIO (無 VOLTH)    │
+              └──────────┬───────────┘
+                         │
+                         ▼
+                ┌────────────────────────────────────┐
+                │         gtp5g 內核模組              │
+                │                                    │
+                │  if (VOLTH) {                      │
+                │      // 不執行                     │
+                │  } else {                          │
+                │      update period counter ✓       │ ◄─── 正確執行！
+                │  }                                 │
+                └────────────────┬───────────────────┘
+                                 │
+                                 ▼
+                      ┌────────────────────┐
+                      │ PERIO Report       │
+                      │ TotalVolume > 0    │
+                      │ TotalPktNum > 0    │
+                      └────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │ hasActualTraffic()   │
+                    │ returns true         │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │ LastActiveTime       │
+                    │ 正確更新 ✓           │
+                    └──────────────────────┘
+```
+
+---
+
+### 驗證方法
+
+1. **重新編譯 SMF 和 UPF**：
+   ```bash
+   cd /home/ubuntu/free5gc-final-project
+   make smf
+   make upf
+   ```
+
+2. **確認配置**：
+   ```yaml
+   # smfcfg.yaml
+   urrPeriod: 30
+   # urrThreshold: 500000  # 確保已註解
+   ```
+
+3. **啟動系統並測試**：
+   ```bash
+   # 啟動 free5gc
+   ./run.sh
+   
+   # 在 UE 端執行 ping 測試
+   ping -I uesimtun0 8.8.8.8
+   ```
+
+4. **檢查 SMF 日誌**：
+   ```bash
+   # 應該看到類似以下日誌
+   [FastCleanup] Updated LastActiveTime for SM Context xxx
+   ```
+
+---
+
+### 版本資訊
+
+- **修復日期**：2025-12-02
+- **適用版本**：free5gc SMF v1.4.0, UPF with gtp5g v0.9.x
+- **測試狀態**：已驗證修復有效

@@ -248,6 +248,10 @@ type SMContext struct {
 	LastActiveTime time.Time
 	// IdleTimeout 閒置超時時間（根據子網策略設定）
 	IdleTimeout time.Duration
+	// LastReportedVolume 上次查詢時的累計流量（bytes）
+	LastReportedVolume uint64
+	// LastReportedPktNum 上次查詢時的累計封包數
+	LastReportedPktNum uint64
 	// ================================
 
 	// lock
