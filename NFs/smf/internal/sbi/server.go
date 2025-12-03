@@ -111,6 +111,30 @@ func newRouter(s *Server) *gin.Engine {
 		}
 	}
 
+	// Debug/Monitoring API for Demo Dashboard (no auth required for local access)
+	debugGroup := router.Group("/debug")
+	debugGroup.GET("/sessions", func(c *gin.Context) {
+		// Enable CORS for demo dashboard
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET")
+		c.Header("Access-Control-Allow-Headers", "Content-Type")
+		
+		sessions := s.Processor().GetAllSessionsIdleInfo()
+		c.JSON(http.StatusOK, gin.H{
+			"sessions": sessions,
+			"timestamp": time.Now().Unix(),
+		})
+	})
+	debugGroup.GET("/stats", func(c *gin.Context) {
+		// Enable CORS for demo dashboard
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET")
+		c.Header("Access-Control-Allow-Headers", "Content-Type")
+		
+		stats := s.Processor().GetCleanerStats()
+		c.JSON(http.StatusOK, stats)
+	})
+
 	return router
 }
 
