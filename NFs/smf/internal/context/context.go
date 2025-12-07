@@ -249,7 +249,7 @@ func InitSmfContext(config *factory.Config) {
 
 	smfContext.Locality = configuration.Locality
 
-	TeidGenerator = idgenerator.NewGenerator(1, math.MaxUint32)
+	TeidGenerator = idgenerator.NewGenerator(1, 40)
 
 	smfContext.Ues = InitSmfUeData()
 }

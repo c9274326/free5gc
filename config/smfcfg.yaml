@@ -91,7 +91,7 @@ configuration:
         interfaces: # Interface list for this UPF
           - interfaceType: N3 # the type of the interface (N3 or N9)
             endpoints: # the IP address of this N3/N9 interface on this UPF
-              - 127.0.0.8
+              - 10.0.1.1
             networkInstances: # Data Network Name (DNN)
               - internet
 
@@ -115,8 +115,19 @@ configuration:
   nrfUri: http://127.0.0.10:8000 # a valid URI of NRF
   nrfCertPem: cert/nrf.pem # NRF Certificate
   urrPeriod: 30 # default usage report period in seconds
-  urrThreshold: 500000 # default usage report threshold in bytes
+  # urrThreshold: 500000 # COMMENTED OUT: 避免 VOLTH trigger 導致 LastActiveTime 無法更新（詳見 fast_cleanup.md）
   requestedUnit: 1000
+  fastCleanup:
+    enabled: true
+    defaultIdleTimeout: 60  # 預設 54 分鐘 (秒)
+    scanInterval: 5        # 每 5 秒掃描一次
+    subnetPolicies:
+      - subnet: "10.60.0.0/24"
+        idleTimeout: 30     # 此子網  30 秒
+      - subnet: "10.61.0.0/24"
+        idleTimeout: 60     # 此子網 60 秒    
+
+
 
 # Logging Configuration
 logger:
